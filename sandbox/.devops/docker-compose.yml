@@ -1,0 +1,16 @@
+services:
+  mooc-manus-sandbox-dev:
+    build:
+      context: ../
+      dockerfile: .devops/Dockerfile
+    #将当前目录挂载到工作空间/workspace
+    volumes:
+      - ../:/workspace
+    #端口映射
+    ports:
+      - "2222:22"  #本地2222 ->容器ssh 22
+      - "8080:8080" #本地的8080-容器的8080
+    #容器的名字
+    container_name: mooc-manus_sandbox_dev
+    #重启的策略
+    restart: always

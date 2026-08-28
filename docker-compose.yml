@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: manus
+    ports:
+      - "5432:5432"
+    volumes:
+      - manus-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d manus"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  sandbox:
+    build:
+      context: ./sandbox
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9222:9222"
+      - "127.0.0.1:5900:5900"
+      - "127.0.0.1:5901:5901"
+    environment:
+      SERVER_TIMEOUT_MINUTES: 60
+      CHROME_ARGS: ""
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/supervisor/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  manus-postgres-data:

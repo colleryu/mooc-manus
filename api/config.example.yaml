@@ -1,0 +1,37 @@
+# 示例配置。复制为 config.yaml 并填入真实值,切勿提交 config.yaml。
+# Copy this to config.yaml and fill in real values. Never commit config.yaml.
+llm_config:
+  base_url: https://api.deepseek.com/
+  api_key: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   # 替换为你的 API Key
+  model_name: deepseek-v4-flash
+  temperature: 1.0
+  max_tokens: 393216
+agent_config:
+  max_iterations: 100
+  max_retries: 3
+  max_search_results: 10
+mcp_config:
+  mcpServers:
+    amap-maps-streamableHTTP:
+      transport: streamable_http
+      enabled: true
+      description: null
+      env: null
+      command: null
+      args: null
+      url: https://mcp.amap.com/mcp?key=YOUR_AMAP_KEY   # 替换为你的高德 MCP Key
+      headers: null
+      trust_env: false
+    jina-mcp-server:
+      transport: streamable_http
+      enabled: true
+      description: null
+      env: null
+      command: null
+      args: null
+      url: https://mcp.jina.ai/v1
+      headers:
+        Authorization: Bearer YOUR_JINA_API_KEY   # 替换为你的 Jina API Key
+      trust_env: true
+a2a_config:
+  a2a_servers: []

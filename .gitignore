@@ -55,3 +55,12 @@ Thumbs.db
 .agents/
 .codex/
 .claude/settings.local.json
+
+# ---- Development notes / debug artifacts ----
+BUGFIX_TASKS.md
+plan.md
+api/TODO-*.md
+api/notebook.md
+sandbox/demo.*
+ui/AGENTS.md
+ui/CLAUDE.md

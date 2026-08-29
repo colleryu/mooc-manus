@@ -1,109 +1,93 @@
-我已经把项目代码完整读了一遍（从 main.py 入口到 domain/infrastructure 各层，以及 prompts、alembic、工具集、浏览器、沙箱、任务队列）。下面是发现的 bug，按严重程度排序，都没有改动任何代码。
+# API 模块：Agent 的大脑与编排中心
 
----
-一、致命：核心路径构造/启动即崩溃
+`api` 是 MoocManus 的核心：既提供 HTTP 接口，也负责 Agent 规划执行、Function Calling、MCP/A2A、沙箱调度、异步任务、事件持久化和文件交付。
 
-1. ShellTool.__init__ 自赋值 — app/domain/services/tools/shell.py:16
-self.sanbox = self.sanbox
-1. RHS 访问不存在的 self.sanbox → AttributeErinit__ 会构造
+## 功能
 
-  Thought for 3s, searched for 1 pattern, read 2 files
+- 管理会话创建、查询、删除、发消息、停止和已读状态。
+- 运行 Planner–ReAct 工作流，生成计划、逐步执行、更新计划并总结。
+- 向 LLM 暴露工具 Schema，解析 `tool_calls`，执行后把结果写回上下文。
+- 管理 Shell、文件、浏览器、搜索、用户交互、MCP、A2A 七类工具包。
+- 为会话创建/恢复 Docker Sandbox，通过 HTTP 和 CDP 控制环境。
+- 保存会话、Memory、计划、事件和文件元数据，上传/下载任务产物。
+- 通过 Redis Streams 驱动任务，通过 SSE 实时推送事件。
+- 提供 LLM、Agent、MCP、A2A 动态配置和基础设施健康检查。
 
-README 为空。让我并行阅读核心文件：入口、配置、以及各层的实现。
+## 技术与实现
 
-  Thought for 6m 34s, read 91 files, ran 3 shell commands
+### Function Calling
 
-我已经把项目代码完整读了一遍（从 main.py 入口到 domain/infrastructure 各层，以及
-prompts、alembic、工具集、浏览器、沙箱、任务 重程度排序，都没有改动任何代码。
+`domain/services/tools/base.py` 的 `@tool` 装饰器把名称、描述、参数和必填项注册为 OpenAI Function Schema。`BaseAgent` 把 Schema 传给模型，读取 `tool_calls`，完成 JSON 参数修复、工具路由、调用重试和 Tool Result 回填。内置 `ShellTool`、`FileTool`、`BrowserTool`、`SearchTool`、`MessageTool`、`MCPTool`、`A2ATool`。
 
----
-一、致命：核心路径构造/启动即崩溃
-                                                                                        1. ShellTool.__init__ 自赋值 — app/domain/ser
-self.sanbox = self.sanbox
-1. RHS 访问不存在的 self.sanbox → AttributeError。而且 PlannerReActFlow.__init__ 会构造 ShellTool(sandbox=sandbox)（flows/planner_rea流程一构建就崩。参数名还拼错了（sanbox/sandbox）。
-2. DBSessionRepository.__init__ 自赋值 — app/infrastructure/repositories/db_session_repository.py:23
-self.db_session = self.db_session
-2. 同上，构造即 AttributeError，应改为 self.db_session = dbsession。
-3. SearchTool 完全不可用 — app/domain/services/tools/search.py
-  - __init__(self) 不接收 search_engine 参数 SearchTool(search_engine=...) → TypeError。
-  - 没调用 super().__init__()，_tool_cache 未初始化，get_tools() 会 AttributeError。
-  - search_web 调用了不存在的 self.search_eng）。
-4. MCPTool 无法被 Agent 调用 — app/domain/services/tools/mcp.py:359
-重写的是 has_tools（复数），但 BaseAgent._get，agents/base.py:66）。MCP 工具永远匹配不到 →ValueError: 未知工具。
-5. RedisStreamTask.invoke 逻辑错乱 — app/infrastructure/external/task/redis_stream_task.py:67-88
-async def invoke(self):
-    if self.done:
-        self._execute_task = asyncio.create_task(self._execute_task())
-  - 把创建的 Task 赋值给了方法名 _execute_task（覆盖了方法本身），而 done 属性读的是 _execution_task（永远 None→True）。
-  - cancel() 里 self._execution_task.cancel()rror。
-  - 另外多处 async 函数没
-await：self._on_task_done()（:64）、self._cle 、_task_runner.on_done（:48），都会产生未await 的协程，清理逻辑实际不执行。
-6. DockerSandbox.ensure_sandbox 把方法当字典 /sandbox/docker_sandbox.py:215
-tool_result = ToolResult.from_sandbox(**response.json)   # 少了 ()
-6. response.json 是方法对象，** 解包非 mapping → TypeError，沙箱永远无法确认就绪。
-7. DockerSandbox IP 解析没 await — docker_san :183（get）
-_get_container_ip/_resolve_hostname_to_ip 都是 async def，却直接 ip = cls._get_container_ip(container) 没 await，得到的是协程对象，拼进 f"http://{ip}:8080"。
-8. PlaywrightBrowser 把 scroll_up 拼成 scrool_up — playwright_borwser.py:409
-协议与 BrowserTool.browser_scroll_up 调的是 browser.scroll_up(...)，实际方法叫 scrool_up → AttributeError。
-9. AgentTaskRunner._pop_event 返回类而非实例
-return Event      # 应为 return event
-9. 调用方 invoke 里 isinstance(event, Message.attachments 会 AttributeError。
+### Planner–ReAct
 
----
-二、高危：核心 Agent 流程运行期错误
+- `PlannerAgent` 通过结构化 JSON 创建 `Plan`，并按步骤结果动态更新计划。
+- `ReActAgent` 围绕单步循环“推理 → 工具调用 → 观察”，最后生成步骤结果。
+- `PlannerReActFlow` 串联 `PLANNING → EXECUTING → UPDATING → SUMMARIZING → COMPLETED`。
+- Memory 按会话和 Agent 分开持久化，步骤间压缩上下文，兼顾连续性和 Token 成本。
 
-10. BaseAgent._add_to_memory 把列表当单条消息 append — agents/base.py:148
-self._memory.add_message(messages)，但 messages 是 List[Dict]，add_message 会把它整体塞进记忆，get_messages() 返回
-[system, [列表]] → 发给 LLM 时结构错误。应调
-11. BaseAgent.invoke 的 for/else 挂错位置 — agents/base.py:259
-else: 挂在内层 for tool_call 上（该循环无 break），所以每执行一次工具都会 yield 一条 ErrorEvent("超过最大迭代次数")，本意应是外层循环耗尽时提示。
-12. BaseAgent._invoke_llm 重试耗尽后无返回 — agents/base.py:80-116
-所有重试都异常后循环直接结束、返回 None，invo") → AttributeError。
-13. PlannerAgent.update_plan 查找“第一个未完成步骤”的循环恒返回 0 — agents/planner.py:94-97
-for idx, step in enumerate(plan.steps):
-    first_pending_index = idx
-    break          # 第一次就 break
-13. 结果 plan.steps[:0] 为空，等于丢弃所有已完成步骤、用新步骤整体覆盖。
-14. ReActAgent.summarize 字段名写错 — agents/react.py:116
-MessageEvent(..., attachment=attachments)，模c 默认忽略未知字段 → 附件被静默丢弃。
-15. SessionModel.created_at 误加 onupdate — infrastructure/models/session.py:87
-created_at 上挂了 onupdate=datetime.now，每次更新会话都会把创建时间一起改掉；应该是 updated_at 才有 onupdate。
-16. Session.latest_message_at 默认值是元组 — domain/models/session.py:32
-latest_message_at: Optional[datetime] = None,   # 末尾逗号 → 默认值是 (None,)                                 16. 已验证 Session().latest_message_at == (No,) 塞进 DateTime 列，出错。
-17. JSONB 用 + 拼接（Postgres 不合法） — db_session_repository.py:113 / 131 / 263                             events = coalesce(...) + cast([...], JSONB)  没有此运算符，add_event/add_file/save_memory会直接 SQL 报错；应使用 ||。                                                                                  18. get_file_by_path 遍历的是 ORM 模型 — db_s
-files = result.scalar_one_or_none() 拿到的是 SessionModel，for file in files: 遍历模型对象 → TypeError；应遍历record.files。
-19. decrement_unread_message_count 的 greatest 只有单参数 — db_session_repository.py:238-240
-func.greatest(coalesce(...)-1) 单参数不会钳制到 0，未读数可减成负数；应为 greatest(coalesce(...)-1, 0)。      20. AgentTaskRunner._handle_tool_event 把 Toorunner.py:228
-file_read_result.get("content","")，ToolResult 是 pydantic 模型没有 .get → AttributeError。
-21. AgentTaskRunner._sync_file_to_storage 参数错 + 空引用 — agent_task_runner.py:151/163                      remove_file(session_id, file.filepath)（该函 为 None 时 file.filepath = filepath 会崩。
-22. 浏览器 JS 大量 inneText 拼写错误 — playwright_browser_fun.py（39/101/122/142/153 等）
-innerText 被写成 inneText，文本/label 提取全部失效；select: selector 引用了未定义的                           selector（playwright_browser_fun.py:180，.js xt}。
-23. PlaywrightBrowser.cleanup 两处错误 — playwright_borwser.py:239/246                                        pages = context.page（无此属性）和 await self
-24. PlaywrightBrowser.input 漏 await / type() 无参 — playwright_borwser.py:347/358                            element = self._get_element_by_id(index)（漏 （缺 text）。
-25. BrowserTool.browser_scroll_up/down 必填参数与 schema 矛盾 — browser.py:193/208                            to_top: Optional[bool]（无默认值），但 @tool(传时 method(**kwargs) 抛 TypeError。应加 =None。
-26. FileTool.find_files 漏 await — file.py:202                                                                return self.sandbox.find_files(...) 返回协程
-27. BaseTool.invoke 用 return 而非 raise — tools/base.py:108
-return ValueError(f"工具[{tool_name}]未找到") 把异常对象当返回值返回，应 raise。
+### MCP
 
----                                                                                                           三、中危：HTTP 语义 / 安全 / 其它
-                                                                                                              28. 健康检查失败仍返回 HTTP 200 — interfaces/-33
-Response.fail(code=503,...) 只改业务 code，HTTP 状态仍是 200，健康检查形同虚设（探活/负载均衡会误判为正常）。 29. 在 Depends 依赖函数上用 @lru_cache —interfaces/service_dependencies.py（get_status_service/get_file_service）、schemas/repository_dependencies.py
-每个请求注入的是新的 AsyncSession/RedisClient，缓存要么失效、要么缓存到已关闭的 session；若对象不可哈希会直接 TypeError。
-30. 密钥明文入库且 .gitignore 未排除 — config.yaml（DeepSeek key、高德 MCP key、Jina token）、.env（COS SecretId/SecretKey）
-当前都是未跟踪状态，一旦提交即泄露。.gitignore 只有 pycache/venv，没有 .env、config.yaml。
-31. .env 里 COS_BUCKET= mooc-manus-... 等号后多了空格 — 值为 " mooc-manus-1319094570"，桶名带前导空格，COS 调用会失败。
-32. CORS allow_origins=["*"] 与 allow_credent2
-浏览器规范下 * + credentials 是无效组合（会被拒绝），也是安全隐患。
-33. BingSearchEngine 兜底正则错误 — bing_sear
-re.search(r"[\d,]+]\s*results", text) 多了个 ] 且无捕获组，永远匹配不上；即使匹配 match.group(1) 也会 IndexError。
-34. past_hour 与 past_day 映射相同 — bing_sea 生效。
-35. get_app_config_service 返回标注 ->None — service_dependencies.py:23，实际返回 AppConfigService。
-36. get_a2a_servers 把 defaultInputModes 空串fig_service.py:176-177，agent_card.get(...,"") 在缺字段时给字符串空值，可能触发 pydantic 校验错误。
+`MCPClientManager` 使用官方 Python SDK 管理多个 Server，支持 **stdio、SSE、Streamable HTTP**。它负责连接、`list_tools` 发现、Schema 缓存、名称路由、`call_tool` 和异步清理。配置可由 API 新增、删除、启停，无需修改 Agent 主循环。
 
----
-补充：目前实际可达性
+### A2A
 
-现有路由只挂了 status / app-config / files（r 务队列这一整套核心路径还没有 HTTP入口。所以上面第 1–27 条大多是“潜伏 bug”，一旦接上 chat/session 端点就会集中爆发；而第 28–36 条里的健康检查、文件上传、CORS、密钥、COS 桶名空格是当前就能触发的。
+`A2AClientManager` 请求 `/.well-known/agent-card.json` 获取远程 Agent 能力并缓存；执行时通过带 `A2A-Version` 的 JSON-RPC `SendMessage` 把子任务委派给远程 Agent。
 
----
-需要的话，我可以按“先修致命→再修高危”的顺序帮 补丁（比如先把第 1、2、3、5、8、9 这些self.xxx = self.xxx / 拼写 / 漏 await 类硬伤清掉）。你说了先不动代码，我就只做只读排查，没改任何文件。
+### 异步任务与事件流
+
+- `RedisStreamTask` 为每次运行提供输入、输出 Stream 和后台 asyncio Task。
+- `AgentTaskRunner` 消费消息、构建 Flow，并持久化 Plan/Step/Tool/Message/Error/Done 事件。
+- `/sessions/{id}/events` 通过 SSE 推送，支持 `Last-Event-ID`/`after` 游标、心跳和续传。
+- PostgreSQL 保存历史，Redis Streams 保存运行态消息，前端断线不会丢失完整过程。
+
+### 分层架构与基础设施
+
+```text
+interfaces       FastAPI Routes / Schema / DI / Exception Handler
+      ↓
+application      Session / File / Config / Status 用例
+      ↓
+domain           Models / Repository Protocol / Agent / Flow / Tool
+      ↓
+infrastructure   OpenAI / PostgreSQL / Redis / COS / Docker / Playwright
+```
+
+Domain 通过 Protocol 依赖 LLM、Sandbox、Browser、Search、Storage 和 Repository，基础设施层提供适配器，体现依赖倒置和可替换基础设施。
+
+### 数据、文件与安全
+
+- SQLAlchemy 2 Async + asyncpg 操作 PostgreSQL，Alembic 管迁移，JSONB 保存事件与 Memory。
+- Redis 承担消息流和运行态任务协调；COS 适配器保存附件与生成产物。
+- API 返回配置时排除 `api_key`，日志包含敏感数据过滤，密钥通过本地配置注入。
+
+## 代码导航
+
+```text
+app/
+├── domain/services/agents/       # BaseAgent、PlannerAgent、ReActAgent
+├── domain/services/flows/        # PlannerReActFlow
+├── domain/services/tools/        # Function Calling、MCP、A2A、内置工具
+├── domain/models/event.py        # 领域事件模型
+├── application/services/         # 会话、文件、配置、状态用例
+├── infrastructure/external/      # LLM、Task、Sandbox、Browser、Search
+├── infrastructure/repositories/  # PostgreSQL/File Config 仓库
+├── infrastructure/storage/       # PostgreSQL、Redis、COS
+└── interfaces/endpoints/         # FastAPI 路由
+```
+
+## 运行与验证
+
+```bash
+cp .env.example .env
+uv sync
+uv run alembic upgrade head
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+uv run pytest
+```
+
+API 文档：<http://localhost:8000/docs>；健康检查：<http://localhost:8000/api/status>。
+
+## 学习成果
+
+这一模块把 LLM 调用从一次性问答升级成有状态、可执行、可扩展的 Agent Runtime。我掌握了 Tool Schema 如何连接模型与真实能力，Planner 和 ReAct 如何协作处理长任务，MCP/A2A 如何解除能力耦合，以及任务流、事件流、存储、错误处理和资源释放如何共同保证 Agent 可靠运行。
